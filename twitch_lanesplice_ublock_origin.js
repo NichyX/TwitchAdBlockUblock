@@ -29,7 +29,8 @@ twitch-lanesplice.js text/javascript
         // embed + onboarding: no preroll on a fresh session (live 2026-11-15); the rest preroll but may be clean in a midroll
         const LANE_TYPES = ['embed', 'onboarding', 'popout', 'site', 'mobile_web'];
         // twitch-trigger, twitch-session, twitch-stream-source, timestamp ranges sit on every normal live playlist (checked 2026-11-15): not ads
-        const AD_RANGE = /stitched|twitch-maf-ad|X-TV-TWITCH-AD|SCTE35/;
+        // twitch-maf-ad is an on-page ad, the stream keeps running under it (live 2026-11-24); render() drops the tag
+        const AD_RANGE = /stitched|X-TV-TWITCH-AD|SCTE35/;
         const AD_URL = /\/adsquared\/|\/_404\/|\/processing/;
         const keyOf = new Map(); // media playlist url -> rendition key
         const tls = new Map();   // rendition key -> timeline
@@ -74,8 +75,8 @@ twitch-lanesplice.js text/javascript
                 if (l.startsWith('#EXT-X-DATERANGE') && AD_RANGE.test(l)) {
                     p.ad = true;
                     const s = Date.parse((/START-DATE="([^"]+)"/.exec(l) || [])[1]);
-                    const d = parseFloat((/DURATION=([\d.]+)/.exec(l) || [])[1]) || 0;
-                    if (!isNaN(s)) { ranges.push([s - 500, s + d * 1000 + 500]); }
+                    const d = parseFloat((/[,:]DURATION=([\d.]+)/.exec(l) || [])[1]) || 0;
+                    if (!isNaN(s)) { ranges.push([s - 500, s + d * 1000 - 500]); }
                 }
             }
             let body = false, pdt = NaN, inf = null, cue = false;
@@ -91,15 +92,28 @@ twitch-lanesplice.js text/javascript
                     const dur = parseFloat(inf.slice(8)) || 2;
                     const live = inf.includes(',live') && !/Amazon|FT\|/.test(inf) && !AD_URL.test(l) && !cue && !isNaN(pdt) && !ranges.some(r => pdt >= r[0] && pdt <= r[1]);
                     if (!live) { p.ad = true; }
-                    p.segs.push({ pdt: pdt, dur: dur, inf: inf, url: l.trim(), live: live });
+                    p.segs.push({ pdt: pdt, dur: dur, inf: inf, url: l.trim(), id: l.trim().split('?')[0], live: live });
                     if (!isNaN(pdt)) { pdt += dur * 1000; }
                     inf = null;
                 } else if (!body && l && !/^#EXT-X-(DATERANGE|DISCONTINUITY-SEQUENCE|ENDLIST)/.test(l)) { p.head.push(l); }
             }
             return p;
         }
-        // Append only live segments newer than the timeline tail. PDT is identical across lanes (verified
-        // live 2026-11-15), so it dedupes main and lane copies of one segment.
+        // After an ad Twitch shifts that session's clock (main ran 1069 ms ahead of the lanes, 2026-11-24). The same
+        // segment has the same path in every session, so a shared segment gives the shift. Without this a segment is
+        // listed twice and the player freezes until reload.
+        function align(tl, segs) {
+            for (let i = 0; i < segs.length; i++) {
+                let shift = 0, j = i;
+                for (; j < segs.length && segs[j].live; j++) {
+                    const at = tl.at.get(segs[j].id);
+                    if (at !== undefined) { shift = at - segs[j].pdt; }
+                }
+                for (; i < j; i++) { segs[i].pdt += shift; }
+            }
+            return segs;
+        }
+        // Append only live segments newer than the timeline tail.
         function feed(tl, segs) {
             for (const s of segs) {
                 if (!s.live || s.pdt <= tl.last + 250) { continue; }
@@ -109,6 +123,8 @@ twitch-lanesplice.js text/javascript
                 if (gap > 30000) { while (tl.segs.length) { if (tl.segs.shift().disc) { tl.dseq++; } } }
                 s.seq = tl.seq++;
                 tl.segs.push(s);
+                tl.at.set(s.id, s.pdt);
+                if (tl.at.size > 60) { tl.at.delete(tl.at.keys().next().value); }
                 tl.last = s.pdt;
                 tl.lastDur = s.dur;
             }
@@ -143,7 +159,7 @@ twitch-lanesplice.js text/javascript
                 u.searchParams.set('token', t.value);
                 u.searchParams.set('p', String(Math.floor(Math.random() * 1e7)));
                 u.searchParams.delete('parent_domains');
-                const r = await realFetch(u.href);
+                const r = await realFetch(u.href, { signal: AbortSignal.timeout(2500) });
                 if (!r.ok) { return null; }
                 const map = new Map();
                 for (const [k, v] of renditions(await r.text())) { if (!map.has(k)) { map.set(k, v); } }
@@ -162,14 +178,14 @@ twitch-lanesplice.js text/javascript
                 const url = l && l.bad < Date.now() && l.map.get(key); // no exact rendition: skip, never downgrade
                 if (!url) { return null; }
                 try {
-                    const r = await realFetch(url);
+                    const r = await realFetch(url, { signal: AbortSignal.timeout(2500) });
                     if (!r.ok) { lanes.delete(type); return null; }
                     const p = parse(await r.text());
                     if (p.ad) { l.bad = Date.now() + 30000; }
                     return { type: type, p: p };
                 } catch (e) { lanes.delete(type); return null; }
             }))).filter(Boolean);
-            feed(tl, [].concat.apply([], got.map(g => g.p.segs)).sort((a, b) => a.pdt - b.pdt));
+            feed(tl, [].concat.apply([], got.map(g => align(tl, g.p.segs))).sort((a, b) => a.pdt - b.pdt));
             const src = got.filter(g => adopt(tl, g.p)).map(g => g.type)[0] || 'none';
             if (src !== tl.src) { console.log('[LaneSplice] ad at ' + key + ': ' + (src === 'none' ? 'no clean lane, holding (no downgrade)' : 'splicing from lane "' + src + '"')); }
             tl.src = src;
@@ -196,9 +212,9 @@ twitch-lanesplice.js text/javascript
             if (!r.ok) { return r; }
             const p = parse(await r.text());
             let tl = tls.get(key);
-            if (!tl) { tl = { segs: [], seq: p.msn, dseq: 0, last: 0, lastDur: 2, head: null, pf: [], src: null }; tls.set(key, tl); }
+            if (!tl) { tl = { segs: [], seq: p.msn, at: new Map(), dseq: 0, last: 0, lastDur: 2, head: null, pf: [], src: null }; tls.set(key, tl); }
             tl.pf = [];
-            feed(tl, p.segs);
+            feed(tl, align(tl, p.segs));
             if (adopt(tl, p)) { tl.src = null; } else if (p.ad) { await fill(key, tl); }
             return new Response(render(tl, p), { status: r.status, statusText: r.statusText });
         };
