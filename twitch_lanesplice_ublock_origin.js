@@ -101,7 +101,7 @@ twitch-lanesplice.js text/javascript
         }
         // After an ad Twitch shifts that session's clock (main ran 1069 ms ahead of the lanes, 2026-11-24). The same
         // segment has the same path in every session, so a shared segment gives the shift. Without this a segment is
-        // listed twice and the player freezes until reload.
+        // listed twice and the player freezes until reload
         function align(tl, segs) {
             for (let i = 0; i < segs.length; i++) {
                 let shift = 0, j = i;
